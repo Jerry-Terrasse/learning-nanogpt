@@ -3,12 +3,13 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
-    n_layer: int =12
+    n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
 
@@ -29,7 +30,7 @@ class CausalSelfAttention(nn.Module):
         
         att = (q @ k.transpose(-2, -1)) * (1. / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = nn.functional.softmax(att, dim=-1)
+        att = F.softmax(att, dim=-1)
         y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -93,7 +94,7 @@ class GPT(nn.Module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        model_hf: GPT2LMHeadModel = GPT2LMHeadModel.from_pretrained(model_type) # type: ignore
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
@@ -117,7 +118,53 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def forward(self, idx):
+        # idx: BxT
+        B, T = idx.size()
+        assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
+        
+        tok_emb = self.transformer.wte(idx)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos)
+        x = tok_emb + pos_emb
+        
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # BxTxV
+        return logits
 
 if __name__ == '__main__':
+    num_return_sequences = 5
+    max_length = 30
+    
     model = GPT.from_pretrained('gpt2')
-    print(model)
+    # print(model)
+    model.eval()
+    model.to('cuda')
+    
+    import tiktoken
+    enc = tiktoken.get_encoding('gpt2')
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    x = tokens.to('cuda')
+    
+    # Generate
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    while x.size(1) < max_length:
+        with torch.no_grad():
+            logits = model(x)
+            logits = logits[:, -1, :] # BxV
+            probs = F.softmax(logits, dim=-1)
+            topk_probs, topk_indices = torch.topk(probs, 50)
+            ix = torch.multinomial(topk_probs, 1) # Bx1
+            xcol = torch.gather(topk_indices, -1, ix)
+            x = torch.cat((x, xcol), dim=1)
+    
+    for i in range(num_return_sequences):
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
